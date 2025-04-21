@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# replay_fast.py — Selenium-based re-player with fast mode, UA, cookies & proxy support
+
+import sys
+import os
+import json
+import time
+import datetime
+import random
+from html import unescape
+from urllib.parse import urlparse
+from typing import List, Dict, Any, Optional, Set
+import argparse
+
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.common.actions.pointer_input import PointerInput
+from selenium.webdriver.common.actions.action_builder import ActionBuilder
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    WebDriverException,
+)
+
+# ─────────────── CLI args & globals ───────────────
+parser = argparse.ArgumentParser(description="Replay browser session (fast mode)")
+parser.add_argument("--log", default="sorted_log.json", help="Path to events JSON")
+parser.add_argument("--skip", default="", help="Comma-separated list of event substrings to skip")
+parser.add_argument("--user-agent", dest="ua", help="User-Agent string to set on the browser")
+parser.add_argument("--cookies", help="Path to JSON file with cookies list")
+parser.add_argument("--proxy", help="Proxy URL, e.g. http://user:pass@host:port")
+args = parser.parse_args()
+SKIP_EVENTS: Set[str] = {s.strip().lower() for s in args.skip.split(",") if s.strip()}
+
+step_counter = 0
+FAIL_DIR = "replay_fails"
+os.makedirs(FAIL_DIR, exist_ok=True)
+
+
+# ─────────────────── Logging ───────────────────
+def log(msg: str):
+    global step_counter
+    stamp = datetime.datetime.now().strftime('%H:%M:%S')
+    print(f"[{stamp}][{step_counter:04d}] {msg}")
+    sys.stdout.flush()
+
+
+# ─────────────────── Helpers ───────────────────
+def normalize_href(href: str, base: str) -> str:
+    href = unescape(href or "")
+    if href.startswith("//"): return "https:" + href
+    if href.startswith("/"):
+        p = urlparse(base)
+        return f"{p.scheme}://{p.netloc}{href}"
+    return href
+
+
+def wait_for_dom_ready(driver, timeout: int = 10):
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except TimeoutException:
+        log("[WARN] DOM readyState timeout")
+
+
+# frame & shadow utilities
+
+def switch_to_frame_chain(driver, chain: List[int]):
+    driver.switch_to.default_content()
+    for idx in chain:
+        frames = driver.find_elements(By.CSS_SELECTOR, "iframe,frame")
+        if idx < len(frames):
+            driver.switch_to.frame(frames[idx])
+        else:
+            raise NoSuchElementException(f"iframe index {idx} not found")
+
+
+def enter_shadow_path(ctx, shadow_path: List[str]):
+    for sel in shadow_path:
+        host = ctx.find_element(By.CSS_SELECTOR, sel)
+        try:
+            ctx = host.shadow_root
+        except AttributeError:
+            ctx = host.parent.execute_script("return arguments[0].shadowRoot", host)
+    return ctx
+
+
+# element finding
+
+def build_combined_selector(data: Dict[str, Any]) -> Optional[str]:
+    parts, tag = [], data.get("tag")
+    if tag: parts.append(tag)
+    if data.get("id"): return tag + f"#{data['id']}"
+    parts.extend(["." + cls for cls in data.get("classList", [])])
+    if data.get("name"): parts.append(f"[name='{data['name']}']")
+    if data.get("placeholder"): parts.append(f"[placeholder='{data['placeholder']}']")
+    if data.get("type"): parts.append(f"[type='{data['type']}']")
+    return "".join(parts) or None
+
+
+def find_in_context(ctx, data: Dict[str, Any]):
+    sel = data.get("selector")
+    if sel:
+        try: return ctx.find_element(By.CSS_SELECTOR, sel)
+        except Exception: pass
+    aria = data.get("aria") or {}
+    if aria.get("label"):
+        try: return ctx.find_element(By.CSS_SELECTOR, f"[aria-label='{aria['label']}']")
+        except Exception: pass
+    if aria.get("role"):
+        try: return ctx.find_element(By.CSS_SELECTOR, f"[role='{aria['role']}']")
+        except Exception: pass
+    for key, by in (("id", By.ID), ("name", By.NAME)):
+        if data.get(key):
+            try: return ctx.find_element(by, data[key])
+            except Exception: pass
+    if data.get("placeholder"):
+        try:
+            tag = data.get("tag", "input")
+            return ctx.find_element(By.CSS_SELECTOR, f"{tag}[placeholder='{data['placeholder']}']")
+        except Exception: pass
+    combo = build_combined_selector(data)
+    if combo:
+        try: return ctx.find_element(By.CSS_SELECTOR, combo)
+        except Exception: pass
+    return None
+
+
+def resolve_element(driver, data: Dict[str, Any], timeout: float = 4):
+    chain = data.get("frameChain", [])
+    shadow = data.get("shadowPath", [])
+    def _find(_):
+        try:
+            switch_to_frame_chain(driver, chain)
+            ctx = driver
+            if shadow: ctx = enter_shadow_path(ctx, shadow)
+            return find_in_context(ctx, data)
+        except Exception:
+            return None
+    try:
+        return WebDriverWait(driver, timeout).until(_find)
+    except TimeoutException:
+        return None
+
+
+# pointer helpers
+
+def perform_click(driver, x: int, y: int):
+    ActionChains(driver).move_by_offset(0, 0).move_by_offset(x, y).click().perform()
+
+
+def perform_drag(driver, seq: List[Dict[str, int]], pointer_type: str = "mouse"):
+    if not seq: return
+    actions = ActionBuilder(driver)
+    mouse = PointerInput(
+        PointerInput.MOUSE if pointer_type == "mouse" else PointerInput.PEN,
+        "drag"
+    )
+    actions.add_action(mouse)
+    start = seq[0]
+    mouse.move_to_location(start["x"], start["y"])
+    mouse.pointer_down()
+    for pt in seq[1:]: mouse.move_to_location(pt["x"], pt["y"], origin="pointer")
+    mouse.pointer_up()
+    actions.perform()
+
+
+def safe_hover(driver, el, data) -> bool:
+    if not el: return False
+    try:
+        if el.is_displayed() and el.size['width'] and el.size['height']:
+            ActionChains(driver).move_to_element(el).perform()
+            return True
+    except WebDriverException:
+        pass
+    bbox = data.get("boundingRect", {})
+    x = bbox.get("x", data.get("x", 0)) + bbox.get("w", 1)//2
+    y = bbox.get("y", data.get("y", 0)) + bbox.get("h", 1)//2
+    try:
+        perform_click(driver, x, y)
+        return True
+    except WebDriverException:
+        return False
+
+
+# ─────────────────── Core replay ───────────────────
+def replay_events(
+    events: List[Dict[str, Any]],
+    user_agent: Optional[str] = None,
+    cookies: Optional[List[Dict[str, Any]]] = None,
+    proxy: Optional[str] = None
+):
+    global step_counter
+    # collect first URLs per tab
+    first_url: Dict[int, str] = {}
+    for ev in events:
+        raw = ev.get('data')
+        if not isinstance(raw, dict):
+            continue
+        u = raw.get('url') or raw.get('href')
+        if u and not u.startswith(('chrome:', 'about:')):
+            first_url.setdefault(ev.get('tabId'), u)
+
+    # prepare Chrome options
+    opts = uc.ChromeOptions()
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    if user_agent:
+        opts.add_argument(f"--user-agent={user_agent}")
+    if proxy:
+        opts.add_argument(f"--proxy-server={proxy}")
+
+    driver = uc.Chrome(options=opts)
+
+    # set cookies if provided
+    if cookies:
+        # navigate to first domain for cookies
+        domain_url = list(cookies)[0].get('domain') if cookies else None
+        url0 = None
+        if first_url:
+            url0 = next(iter(first_url.values()))
+        target_url = url0 or f"https://{domain_url}" if domain_url else None
+        if target_url:
+            driver.get(target_url)
+            for ck in cookies:
+                try:
+                    driver.add_cookie(ck)
+                except Exception:
+                    pass
+
+    handles: Dict[int, str] = {}
+    last_url: Dict[int, str] = {}
+    prev_input: Optional[str] = None
+
+    for ev in events:
+        step_counter += 1
+        typ = ev.get('type','')
+        low = typ.lower()
+        if any(sub in low for sub in SKIP_EVENTS):
+            log(f"{typ:>10s} (skipped)")
+            continue
+
+        log(f"{typ:>10s} Δ={ev.get('delta',0):>4} ms")
+        time.sleep(min(ev.get('delta',150)/1000, 0.5))
+
+        tab = ev.get('tabId')
+        if tab is None: continue
+
+        if tab not in handles:
+            driver.switch_to.new_window('tab')
+            handles[tab] = driver.current_window_handle
+            url0 = first_url.get(tab)
+            if url0:
+                driver.get(url0); wait_for_dom_ready(driver)
+                last_url[tab] = url0
+        driver.switch_to.window(handles[tab])
+
+        raw = ev.get('data')
+        data = raw if isinstance(raw, dict) else {}
+        try:
+            # NAVIGATION
+            if typ == 'navigate_intent':
+                href = data.get('href')
+                if data.get('was_recent_click') and href:
+                    driver.get(normalize_href(href, last_url.get(tab, href)))
+                    wait_for_dom_ready(driver)
+                    last_url[tab] = driver.current_url
+                continue
+            if typ == 'completed_navigation':
+                last_url[tab] = data.get('url', driver.current_url)
+                continue
+
+            # ACTIONS
+            if typ == 'click':
+                el = resolve_element(driver, data)
+                if el and el.is_enabled():
+                    try: el.click()
+                    except Exception:
+                        bbox = data.get('boundingRect', {})
+                        perform_click(driver, bbox.get('x',0), bbox.get('y',0))
+                else:
+                    bbox = data.get('boundingRect', {})
+                    perform_click(driver, bbox.get('x',0), bbox.get('y',0))
+
+            elif typ == 'keydown':
+                act = driver.switch_to.active_element
+                key = data.get('key','')
+                mods = []
+                if data.get('ctrlKey'): mods.append(Keys.CONTROL)
+                if data.get('shiftKey'): mods.append(Keys.SHIFT)
+                if data.get('altKey'): mods.append(Keys.ALT)
+                if data.get('metaKey'): mods.append(Keys.COMMAND)
+                act.send_keys(*mods, key)
+
+            elif typ == 'input':
+                el = resolve_element(driver, data)
+                if not el: continue
+                sel = data.get('selector') or build_combined_selector(data) or ''
+                val = data.get('value','')
+                cur = el.get_attribute('value') or ''
+                if prev_input == sel and val.startswith(cur):
+                    el.send_keys(val[len(cur):])
+                else:
+                    el.clear(); el.send_keys(val)
+                prev_input = sel
+
+            elif typ == 'scroll':
+                driver.execute_script("window.scrollTo(arguments[0], arguments[1]);",
+                                      data.get('x',0), data.get('y',0))
+
+            elif typ == 'wheel':
+                dy = data.get('deltaY', data.get('y', 0))
+                driver.execute_script("window.scrollBy(0, arguments[0]);", dy)
+                time.sleep(random.uniform(0.1, 0.2))
+
+            elif typ == 'mouse_move':
+                pts = data.get('positions', [])
+                if pts:
+                    perform_drag(driver, pts, data.get('pointerType','mouse'))
+                time.sleep(random.uniform(0.05, 0.15))
+
+            elif typ == 'hover':
+                el = resolve_element(driver, data, timeout=0.5)
+                if not safe_hover(driver, el, data):
+                    log("hover skipped (fast mode)")
+
+            elif typ == 'drag_sequence':
+                perform_drag(driver, data.get('points', []), data.get('pointerType','mouse'))
+
+        except WebDriverException as e:
+            log(f"ERROR during {typ}: {e}")
+            try:
+                driver.save_screenshot(os.path.join(FAIL_DIR, f"fail_{step_counter:04d}.png"))
+            except Exception:
+                pass
+
+    time.sleep(1)
+    driver.quit()
+
+
+# ───────────────────── Runner ─────────────────────
+if __name__ == '__main__':
+    # load events
+    cookies: List[Dict[str, Any]] = []
+    if args.cookies:
+        try:
+            with open(args.cookies, 'r', encoding='utf-8') as f:
+                cookies = json.load(f)
+        except Exception as e:
+            log(f"[Cookie ERROR] {e}")
+            sys.exit(1)
+    try:
+        with open(args.log, 'r', encoding='utf-8') as f:
+            evs = json.load(f)
+    except Exception as e:
+        log(f"[Log ERROR] {e}")
+        sys.exit(1)
+    evs.sort(key=lambda e: e.get('timestamp', 0))
+
+    # run replay with UA, cookies, proxy
+    replay_events(
+        events=evs,
+        user_agent=args.ua,
+        cookies=cookies,
+        proxy=args.proxy
+    )
