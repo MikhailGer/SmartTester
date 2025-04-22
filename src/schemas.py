@@ -1,6 +1,6 @@
 from datetime import datetime
-from typing import Optional, Any, List
-from pydantic import BaseModel, HttpUrl
+from typing import Optional, Any, List, Literal
+from pydantic import BaseModel, HttpUrl, Field
 
 
 class ProxyCreate(BaseModel):
@@ -21,14 +21,28 @@ class ProxyRead(ProxyCreate):
         orm_mode = True
 
 
+class InstructionSetCreate(BaseModel):
+    name: str
+    type: Literal['farm', 'job']
+    instructions: Any  # JSON сценарий для исполнения
+
+
+class InstructionSetRead(InstructionSetCreate):
+    id: int
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
 class FarmTaskCreate(BaseModel):
-    # target_url: HttpUrl
-    instructions: Any  # JSON-структура сценария
+    instruction_set_id: int
 
 
 class FarmTaskRead(BaseModel):
     id: int
-    # target_url: HttpUrl
+    instruction_set_id: int
+    proxy_id: int = Field(..., alias="assigned_proxy_id")
     status: str
     created_at: datetime
     completed_at: Optional[datetime]
@@ -40,6 +54,7 @@ class FarmTaskRead(BaseModel):
 
 class UserSessionRead(BaseModel):
     id: int
+    farm_task_id: int
     proxy_id: int
     cookies: Any    # JSON-массив куки
     user_agent: str
@@ -51,12 +66,14 @@ class UserSessionRead(BaseModel):
 
 
 class JobTaskCreate(BaseModel):
-    instructions: Any
+    instruction_set_id: int
+
 
 
 class JobTaskRead(BaseModel):
     id: int
     session_id: int
+    instruction_set_id: int
     status: str
     created_at: datetime
     completed_at: Optional[datetime]

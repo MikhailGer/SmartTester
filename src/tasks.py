@@ -3,7 +3,7 @@ from src.config import get_db
 import src.crud, src.models, src.replayer
 
 @celery_app.task(name="farm_cookie")
-def farm_cookie(task_id: int):
+def farm_cookie(task_id: int, skip_substrings: list[str] | None = None):
     db = next(get_db())
     farm = src.crud.get_farm_task(db, task_id)
     if not farm:
@@ -17,9 +17,11 @@ def farm_cookie(task_id: int):
     )
 
     # Реплей фарминга
-    events = farm.instructions
+    inst_set = farm.instruction_set
+    events = inst_set.instructions
     src.replayer.replay_events(
         events,
+        skip_substrings=set(skip_substrings or []),
         user_agent=None,
         cookies=None,
         proxy=None
@@ -40,7 +42,7 @@ def farm_cookie(task_id: int):
     return f"Created UserSession {us.id} for FarmTask {task_id}"
 
 @celery_app.task(name="run_job")
-def run_job(job_id: int):
+def run_job(job_id: int, skip_substrings: list[str] | None = None):
     db = next(get_db())
     job = src.crud.get_job_task(db, job_id)
     if not job:
@@ -54,9 +56,11 @@ def run_job(job_id: int):
     )
 
     # Реплей боевого сценария
-    events = job.instructions
+    inst_set = job.instruction_set
+    events = inst_set.instructions
     src.replayer.replay_events(
         events,
+        skip_substrings=set(skip_substrings or []),
         user_agent=job.session.user_agent,
         cookies=job.session.cookies,
         proxy=None

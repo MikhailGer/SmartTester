@@ -3,7 +3,13 @@ from typing import List, Any, Optional
 from sqlalchemy.orm import Session
 
 import src.models, src.schemas
-from src.models import StatusEnum
+from src.models import (
+    StatusEnum,
+    InstructionSet,
+    InstructionType,
+    FarmTask,
+    JobTask,
+)
 
 
 # --- Proxy CRUD ---
@@ -30,42 +36,44 @@ def create_farm_task(
     db: Session,
     farm_in: src.schemas.FarmTaskCreate,
     proxy_id: int
-) -> src.models.FarmTask:
-    task = src.models.FarmTask(
-        instructions=farm_in.instructions,
+) -> FarmTask:
+    # Проверяем наличие набора инструкций и его тип
+    instr_set = db.get(InstructionSet, farm_in.instruction_set_id)
+    if not instr_set:
+        raise ValueError(f"InstructionSet {farm_in.instruction_set_id} not found")
+    if instr_set.type != InstructionType.farm:
+        raise ValueError(f"InstructionSet {instr_set.id} is not of type 'farm'")
+
+    task = FarmTask(
+        instruction_set_id=instr_set.id,
         assigned_proxy_id=proxy_id
     )
-    # task = src.models.FarmTask(
-    #     target_url=str(farm_in.target_url),
-    #     instructions=farm_in.instructions,
-    #     assigned_proxy_id=proxy_id
-    # )
     db.add(task)
     db.commit()
     db.refresh(task)
     return task
 
 
-def get_farm_task(db: Session, task_id: int) -> Optional[src.models.FarmTask]:
-    return db.get(src.models.FarmTask, task_id)
+def get_farm_task(db: Session, task_id: int) -> Optional[FarmTask]:
+    return db.get(FarmTask, task_id)
 
 
-def get_pending_farm(db: Session) -> List[src.models.FarmTask]:
+def get_pending_farm(db: Session) -> List[FarmTask]:
     return (
-        db.query(src.models.FarmTask)
-          .filter(src.models.FarmTask.status == StatusEnum.pending)
-          .order_by(src.models.FarmTask.created_at)
+        db.query(FarmTask)
+          .filter(FarmTask.status == StatusEnum.pending)
+          .order_by(FarmTask.created_at)
           .all()
     )
 
 
 def update_farm_task_status(
     db: Session,
-    task: src.models.FarmTask,
+    task: FarmTask,
     status: StatusEnum,
     completed_at: Optional[datetime] = None,
     error: Optional[str] = None
-) -> src.models.FarmTask:
+) -> FarmTask:
     task.status = status
     if completed_at is not None:
         task.completed_at = completed_at
@@ -80,7 +88,7 @@ def update_farm_task_status(
 
 def create_user_session(
     db: Session,
-    farm_task: src.models.FarmTask,
+    farm_task: FarmTask,
     cookies: List[dict],
     user_agent: str,
     expires_at: Optional[datetime] = None
@@ -112,10 +120,17 @@ def create_job_task(
     db: Session,
     job_in: src.schemas.JobTaskCreate,
     session_id: int
-) -> src.models.JobTask:
-    jt = src.models.JobTask(
+) -> JobTask:
+    # Проверяем наличие набора инструкций и его тип
+    instr_set = db.get(InstructionSet, job_in.instruction_set_id)
+    if not instr_set:
+        raise ValueError(f"InstructionSet {job_in.instruction_set_id} not found")
+    if instr_set.type != InstructionType.job:
+        raise ValueError(f"InstructionSet {instr_set.id} is not of type 'job'")
+
+    jt = JobTask(
         session_id=session_id,
-        instructions=job_in.instructions
+        instruction_set_id=instr_set.id
     )
     db.add(jt)
     db.commit()
@@ -123,26 +138,26 @@ def create_job_task(
     return jt
 
 
-def get_job_task(db: Session, job_id: int) -> Optional[src.models.JobTask]:
-    return db.get(src.models.JobTask, job_id)
+def get_job_task(db: Session, job_id: int) -> Optional[JobTask]:
+    return db.get(JobTask, job_id)
 
 
-def get_pending_jobs(db: Session) -> List[src.models.JobTask]:
+def get_pending_jobs(db: Session) -> List[JobTask]:
     return (
-        db.query(src.models.JobTask)
-          .filter(src.models.JobTask.status == StatusEnum.pending)
-          .order_by(src.models.JobTask.created_at)
+        db.query(JobTask)
+          .filter(JobTask.status == StatusEnum.pending)
+          .order_by(JobTask.created_at)
           .all()
     )
 
 
 def update_job_task_status(
     db: Session,
-    job: src.models.JobTask,
+    job: JobTask,
     status: StatusEnum,
     completed_at: Optional[datetime] = None,
     error: Optional[str] = None
-) -> src.models.JobTask:
+) -> JobTask:
     job.status = status
     if completed_at is not None:
         job.completed_at = completed_at
@@ -157,7 +172,7 @@ def update_job_task_status(
 
 def create_job_report(
     db: Session,
-    job_task: src.models.JobTask,
+    job_task: JobTask,
     status_code: Optional[int] = None,
     result_text: Optional[str] = None,
     report_metadata: Any = None,
@@ -178,3 +193,31 @@ def create_job_report(
 
 def get_reports_by_job(db: Session, job_id: int) -> List[src.models.JobReport]:
     return db.query(src.models.JobReport).filter(src.models.JobReport.job_task_id == job_id).all()
+
+# --- InstructionSet CRUD ---
+def create_instruction_set(
+    db: Session,
+    inst_in: src.schemas.InstructionSetCreate
+) -> src.models.InstructionSet:
+    inst = src.models.InstructionSet(
+        name=inst_in.name,
+        type=inst_in.type,
+        instructions=inst_in.instructions
+    )
+    db.add(inst)
+    db.commit()
+    db.refresh(inst)
+    return inst
+
+
+def list_instruction_sets(
+    db: Session
+) -> list[src.models.InstructionSet]:
+    return db.query(src.models.InstructionSet).order_by(src.models.InstructionSet.created_at).all()
+
+
+def get_instruction_set(
+    db: Session,
+    inst_id: int
+) -> src.models.InstructionSet | None:
+    return db.get(src.models.InstructionSet, inst_id)

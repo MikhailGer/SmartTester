@@ -10,6 +10,20 @@ import enum
 from src.config import Base
 
 
+class InstructionType(str, enum.Enum):
+    farm = "farm"
+    job = "job"
+
+
+class InstructionSet(Base):
+    __tablename__ = "instruction_sets"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, unique=True)
+    type = Column(Enum(InstructionType), nullable=False)
+    instructions = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class StatusEnum(str, enum.Enum):
     pending = "pending"
     processing = "processing"
@@ -45,7 +59,12 @@ class FarmTask(Base):
 
     id = Column(Integer, primary_key=True)
     target_url = Column(String, nullable=False)
-    instructions = Column(JSON, nullable=False)
+    # instructions = Column(JSON, nullable=False)
+    instruction_set_id = Column(
+        Integer,
+        ForeignKey("instruction_sets.id", ondelete="RESTRICT"),
+        nullable=False
+    )
     assigned_proxy_id = Column(Integer, ForeignKey("proxies.id"), nullable=False)
     status = Column(Enum(StatusEnum), default=StatusEnum.pending, nullable=False)
     error = Column(Text)
@@ -53,6 +72,7 @@ class FarmTask(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime)
 
+    instruction_set = relationship("InstructionSet")
     proxy = relationship("Proxy", back_populates="farm_tasks")
     user_session = relationship("UserSession", back_populates="farm_task", uselist=False)
 
@@ -85,13 +105,19 @@ class JobTask(Base):
 
     id = Column(Integer, primary_key=True)
     session_id = Column(Integer, ForeignKey("user_sessions.id"), nullable=False)
-    instructions = Column(JSON, nullable=False)
+    # instructions = Column(JSON, nullable=False)
+    instruction_set_id = Column(
+        Integer,
+        ForeignKey("instruction_sets.id", ondelete="RESTRICT"),
+        nullable=False
+    )
     status = Column(Enum(StatusEnum), default=StatusEnum.pending, nullable=False)
     error = Column(Text)
     attempts_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime)
 
+    instruction_set = relationship("InstructionSet")
     session = relationship("UserSession", back_populates="job_tasks")
     reports = relationship("JobReport", back_populates="job_task")
 

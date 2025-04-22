@@ -1,7 +1,10 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File
+from typing import Literal, Any
+import json
+
 from sqlalchemy.orm import Session
 from src.config import get_db, engine
-import src.models, src.crud, src.schemas
+import src.models, src.crud, src.schemas, src.tasks
 from src.models import Base, StatusEnum
 
 
@@ -43,8 +46,20 @@ def run_farm_task(task_id: int, db: Session = Depends(get_db)):
     task = src.crud.get_farm_task(db, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="FarmTask not found")
-    # Запланировать Celery-задачу (псевдокод)
-    # farm_cookie.delay(task_id)
+
+        # ---проверка: не запускать, если сессия уже есть ---
+    existing = (
+        db.query(src.models.UserSession)
+        .filter(src.models.UserSession.farm_task_id == task_id)
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"UserSession for FarmTask {task_id} already exists (id={existing.id})"
+        )
+    # Запланировать Celery-задачу
+    src.tasks.farm_cookie.delay(task_id)
     return {"message": "Farm task scheduled", "task_id": task_id}
 
 # --- UserSession Endpoints ---
@@ -85,3 +100,67 @@ def get_job_reports(job_id: int, db: Session = Depends(get_db)) -> list[src.mode
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# --- InstructionSet Endpoints ---
+@app.post("/instruction_sets/", response_model=src.schemas.InstructionSetRead)
+async def create_instruction_set(
+    name: str = Form(..., description="Уникальное имя набора инструкций"),
+    type: Literal["farm", "job"] = Form(..., description="Тип: farm или job"),
+    instructions_text: str | None = Form(
+        None,
+        description="JSON сценарий как текст (необязательно, можно вместо этого загрузить файл)"
+    ),
+    instructions_file: UploadFile | None = File(
+        None,
+        description="JSON файл со сценарием (необязательно, можно вместо этого вставить текст)"
+    ),
+    db: Session = Depends(get_db),
+):
+    # считываем и парсим из того, что пользователь передал
+    raw_data: Any
+    if instructions_file:
+        raw = await instructions_file.read()
+        try:
+            raw_data = json.loads(raw)
+        except ValueError:
+            raise HTTPException(400, detail="Invalid JSON in uploaded file")
+    elif instructions_text:
+        try:
+            raw_data = json.loads(instructions_text)
+        except ValueError:
+            raise HTTPException(400, detail="Invalid JSON in text field")
+    else:
+        raise HTTPException(400, detail="Provide either JSON text or upload a file")
+
+    inst_in = src.schemas.InstructionSetCreate(
+        name=name,
+        type=type,
+        instructions=raw_data
+    )
+    return src.crud.create_instruction_set(db, inst_in)
+
+
+@app.get(
+    "/instruction_sets/",
+    response_model=list[src.schemas.InstructionSetRead],
+    summary="Получить список всех наборов инструкций"
+)
+def list_instruction_sets(
+    db: Session = Depends(get_db)
+) -> list[src.models.InstructionSet]:
+    return src.crud.list_instruction_sets(db)
+
+
+@app.get(
+    "/instruction_sets/{inst_id}",
+    response_model=src.schemas.InstructionSetRead,
+    summary="Получить один набор инструкций по ID"
+)
+def get_instruction_set(
+    inst_id: int,
+    db: Session = Depends(get_db)
+) -> src.models.InstructionSet:
+    inst = src.crud.get_instruction_set(db, inst_id)
+    if not inst:
+        raise HTTPException(status_code=404, detail="InstructionSet not found")
+    return inst
