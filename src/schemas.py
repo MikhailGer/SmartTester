@@ -37,11 +37,15 @@ class InstructionSetRead(InstructionSetCreate):
 
 class FarmTaskCreate(BaseModel):
     instruction_set_id: int
+    base_session_id: Optional[int]
+    # inplace: bool = False
+
 
 
 class FarmTaskRead(BaseModel):
     id: int
     instruction_set_id: int
+    base_session_id: Optional[int]
     proxy_id: int = Field(..., alias="assigned_proxy_id")
     status: str
     created_at: datetime

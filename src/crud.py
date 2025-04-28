@@ -35,7 +35,7 @@ def list_proxies(db: Session) -> List[src.models.Proxy]:
 def create_farm_task(
     db: Session,
     farm_in: src.schemas.FarmTaskCreate,
-    proxy_id: int
+    proxy_id: int,
 ) -> FarmTask:
     # Проверяем наличие набора инструкций и его тип
     instr_set = db.get(InstructionSet, farm_in.instruction_set_id)
@@ -46,7 +46,8 @@ def create_farm_task(
 
     task = FarmTask(
         instruction_set_id=instr_set.id,
-        assigned_proxy_id=proxy_id
+        assigned_proxy_id=proxy_id,
+        base_session_id=farm_in.base_session_id
     )
     db.add(task)
     db.commit()
@@ -91,14 +92,17 @@ def create_user_session(
     farm_task: FarmTask,
     cookies: List[dict],
     user_agent: str,
-    expires_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None,
+    parent_session_id: Optional[int] = None
+
 ) -> src.models.UserSession:
     us = src.models.UserSession(
         farm_task_id=farm_task.id,
         proxy_id=farm_task.assigned_proxy_id,
         cookies=cookies,
         user_agent=user_agent,
-        expires_at=expires_at
+        expires_at=expires_at,
+        parent_session_id = parent_session_id
     )
     db.add(us)
     db.commit()
@@ -221,3 +225,18 @@ def get_instruction_set(
     inst_id: int
 ) -> src.models.InstructionSet | None:
     return db.get(src.models.InstructionSet, inst_id)
+
+def update_user_session(
+    db: Session,
+    session: src.models.UserSession,
+    cookies: list[dict],
+    user_agent: str,
+    expires_at: Optional[datetime] = None
+) -> src.models.UserSession:
+    session.cookies = cookies
+    session.user_agent = user_agent
+    if expires_at is not None:
+        session.expires_at = expires_at
+    db.commit()
+    db.refresh(session)
+    return session

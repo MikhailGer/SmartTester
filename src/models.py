@@ -71,10 +71,12 @@ class FarmTask(Base):
     attempts_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime)
+    base_session_id = Column(Integer, nullable=True)
 
     instruction_set = relationship("InstructionSet")
     proxy = relationship("Proxy", back_populates="farm_tasks")
     user_session = relationship("UserSession", back_populates="farm_task", uselist=False)
+
 
 
 class UserSession(Base):
@@ -91,6 +93,7 @@ class UserSession(Base):
     fingerprint = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     expires_at = Column(DateTime)
+    parent_session_id = Column(Integer, ForeignKey("user_sessions.id"), nullable=True)
 
     proxy = relationship("Proxy", back_populates="user_sessions")
     farm_task = relationship("FarmTask", back_populates="user_session")

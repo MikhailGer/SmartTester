@@ -9,7 +9,7 @@ import datetime
 import random
 from html import unescape
 from urllib.parse import urlparse
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -23,6 +23,10 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
 )
+
+# ────────────── подгружаем cookie-killer JS ──────────────
+with open(os.path.join(os.path.dirname(__file__), "cookie_killer.js"), "r", encoding="utf-8") as _f:
+    COOKIE_KILLER_JS = _f.read()
 
 # ─────────────── Globals ───────────────
 step_counter = 0
@@ -130,6 +134,7 @@ def find_in_context(ctx, data: Dict[str, Any]):
 def resolve_element(driver, data: Dict[str, Any], timeout: float = 4):
     chain = data.get("frameChain", [])
     shadow = data.get("shadowPath", [])
+
     def _find(_):
         try:
             switch_to_frame_chain(driver, chain)
@@ -139,6 +144,7 @@ def resolve_element(driver, data: Dict[str, Any], timeout: float = 4):
             return find_in_context(ctx, data)
         except Exception:
             return None
+
     try:
         return WebDriverWait(driver, timeout).until(_find)
     except TimeoutException:
@@ -186,15 +192,29 @@ def safe_hover(driver, el, data) -> bool:
         return False
 
 
+def cookie_killer(drv):
+    try:
+        drv.execute_script("""
+                    [...document.querySelectorAll('[role="button"],button,div')]
+                      .flatMap(el => [...el.querySelectorAll('*'), el])       // сам элемент + все его потомки
+                      .filter(el => /allow all|accept|принять|разрешить|согласен/i.test(el.textContent))
+                      .forEach(el => el.click());
+                """)
+    except Exception:
+        pass
+
+
 # ─────────────────── Core replay ───────────────────
+
 def replay_events(
-    events: List[Dict[str, Any]],
-    skip_substrings: Optional[Set[str]] = None,
-    user_agent: Optional[str] = None,
-    cookies: Optional[List[Dict[str, Any]]] = None,
-    proxy: Optional[str] = None
-):
-    global step_counter
+        events: List[Dict[str, Any]],
+        skip_substrings: Optional[Set[str]] = None,
+        user_agent: Optional[str] = None,
+        cookies: Optional[List[Dict[str, Any]]] = None,
+        proxy: Optional[str] = None
+) -> Tuple[list[Dict[str, Any]], str]:
+    global step_counter, last_kill
+    last_kill = time.time()
 
     if skip_substrings is None:
         skip_substrings = set()
@@ -236,6 +256,10 @@ def replay_events(
     prev_input: Optional[str] = None
 
     for ev in events:
+        if time.time() - last_kill >= 5:
+            cookie_killer(driver)
+            last_kill = time.time()
+
         step_counter += 1
         typ = ev.get("type", "")
         low = typ.lower()
@@ -345,9 +369,11 @@ def replay_events(
                 driver.save_screenshot(os.path.join(FAIL_DIR, f"fail_{step_counter:04d}.png"))
             except Exception:
                 pass
-
+    final_cookies = driver.get_cookies()
+    final_user_agent = driver.execute_script("return navigator.userAgent;")
     time.sleep(1)
     driver.quit()
+    return final_cookies, final_user_agent
 
 
 # ───────────────────── CLI Entrypoint ─────────────────────
