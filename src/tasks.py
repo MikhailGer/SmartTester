@@ -1,6 +1,6 @@
 from src.celery_app import celery_app
 from src.config import get_db
-import src.crud, src.models, src.replayer
+import src.crud, src.models, src.replayer_new
 
 
 @celery_app.task(name="farm_cookie")
@@ -30,7 +30,7 @@ def farm_cookie(task_id: int, base_session_id: int | None = None, skip_substring
     inst_set = farm.instruction_set
     events = inst_set.instructions
 
-    cookie, user_agent = src.replayer.replay_events(
+    cookie, user_agent = src.replayer_new.replay_events(
         events,
         skip_substrings=set(skip_substrings or []),
         user_agent=base_ua,
@@ -81,7 +81,7 @@ def run_job(job_id: int, skip_substrings: list[str] | None = None):
     # Реплей боевого сценария
     inst_set = job.instruction_set
     events = inst_set.instructions
-    src.replayer.replay_events(
+    src.replayer_new.replay_events(
         events,
         skip_substrings=set(skip_substrings or []),
         user_agent=job.session.user_agent,
