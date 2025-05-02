@@ -229,11 +229,24 @@ def replay_events(
     # prepare Chrome options
     opts = uc.ChromeOptions()
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    if user_agent:
-        opts.add_argument(f"--user-agent={user_agent}")
+
+    if not user_agent:
+        try:
+            ua = UserAgent()
+            user_agent = ua.random
+            log(f"[INFO] Randomly selected User-Agent: {user_agent}")
+        except Exception as e:
+            log(f"[Log ERROR] {e}")  # На всякий случай подставляем дефолтный user-agent, чтобы не упасть
+            user_agent = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/115.0.0.0 Safari/537.36")
+    else:
+        log(f"[INFO] User-Agent from args: {user_agent}")
+
+    # if user_agent:
+    #     opts.add_argument(f"--user-agent={user_agent}")
     if proxy:
         opts.add_argument(f"--proxy-server={proxy}")
-
+    opts.add_argument(f"--user-agent={user_agent}")
     driver = uc.Chrome(options=opts)
 
     # set cookies if provided
@@ -413,6 +426,8 @@ if __name__ == "__main__":
             log(f"[Log ERROR] {e}")  # На всякий случай подставляем дефолтный user-agent, чтобы не упасть
             user_agent = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/115.0.0.0 Safari/537.36")
+    else:
+        log(f"[INFO] User-Agent from args: {user_agent}")
 
     evs.sort(key=lambda e: e.get("timestamp", 0))
 

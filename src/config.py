@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # URL брокера для Celery (Redis или RabbitMQ)
     REDIS_URL: Optional[str] = None
     RABBITMQ_URL: Optional[str] = None
+    DEFAULT_UA: Optional[str] = None
 
     class Config:
         env_file = ".env"

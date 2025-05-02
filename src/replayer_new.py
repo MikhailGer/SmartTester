@@ -11,10 +11,12 @@
 # ------------------------------------------------------------
 
 import sys, os, json, time, datetime, random
+from pathlib import Path
 from html import unescape
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional, Set, Tuple
 from fake_useragent import UserAgent
+from src.config import settings
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -26,16 +28,30 @@ from selenium.webdriver.common.actions.action_builder import ActionBuilder
 from selenium.common.exceptions import (
     NoSuchElementException, TimeoutException, WebDriverException,
 )
+from dataclasses import dataclass
+from collections import defaultdict
+
+
+@dataclass
+class TabState:
+    pending_url: str | None = None      # ждём first completed
+    last_nav_ts: float = 0.0            # время последнего принятого completed_navigation
+    last_user_ts: float = 0.0           # последний интерактивный эвент
+    last_url: str = "about:blank"
+
 
 step_counter = 0
 FAIL_DIR = "replay_fails"
 os.makedirs(FAIL_DIR, exist_ok=True)
+tabs: dict[int, TabState] = defaultdict(TabState)
+
 
 def log(msg: str):
     global step_counter
     stamp = datetime.datetime.now().strftime('%H:%M:%S')
     print(f"[{stamp}][{step_counter:04d}] {msg}")
     sys.stdout.flush()
+
 
 # ---------- helpers --------------------------------------------------------
 
@@ -71,7 +87,8 @@ def switch_to_frame_chain(driver, chain: List[int]):
 def enter_shadow_path(ctx, shadow_path: List[str]):
     for sel in shadow_path:
         host = ctx.find_element(By.CSS_SELECTOR, sel)
-        ctx = host.shadow_root if host.shadow_root else host.parent.execute_script("return arguments[0].shadowRoot", host)
+        ctx = host.shadow_root if host.shadow_root else host.parent.execute_script("return arguments[0].shadowRoot",
+                                                                                   host)
     return ctx
 
 
@@ -124,21 +141,116 @@ def find_in_context(ctx, data: Dict[str, Any]):
     return None
 
 
-def resolve_element(driver, data: Dict[str, Any], timeout: float = 4):
+def resolve_element(driver, data: dict, timeout: float = 2.0):
     chain = data.get("frameChain", [])
     shadow = data.get("shadowPath", [])
+    href = data.get("href")
+    snippet = (data.get("text") or "").strip()[:80]
+
+    def _attempt(ctx):
+        # 1) оригинальный селектор / aria
+        el = find_in_context(ctx, data)
+        if el:
+            return el
+
+        # 2) <a href="...">
+        if href:
+            q = f'a[href="{href}"],a[href="{href.rstrip("/")}" ]'
+            el = ctx.find_elements(By.CSS_SELECTOR, q)
+            if el:
+                return el[0]
+
+            netloc = urlparse(href).netloc
+            el = ctx.find_elements(By.CSS_SELECTOR, f'a[href*="{netloc}"]')
+            if el:
+                return el[0]
+
+        # 3) совпадение по тексту
+        if snippet:
+            for a in ctx.find_elements(By.TAG_NAME, "a"):
+                if snippet.lower() in (a.text or "").lower():
+                    return a
+        return None
 
     def _find(_):
         try:
             switch_to_frame_chain(driver, chain)
             ctx = driver if not shadow else enter_shadow_path(driver, shadow)
-            return find_in_context(ctx, data)
+            return _attempt(ctx)
         except Exception:
             return None
+
     try:
         return WebDriverWait(driver, timeout).until(_find)
     except TimeoutException:
         return None
+
+
+# def resolve_element(driver, data: Dict[str, Any], timeout: float = 4):
+#     def resolve_element(driver, data: Dict[str, Any], timeout: float = 2.0):
+#         """
+#         Пытаемся найти элемент тремя волнами:
+#         1.  исходный selector или aria‑атрибуты (как было);
+#         2.  <a> с тем же href;
+#         3.  <a> по фрагменту текста.
+#         """
+#         chain = data.get("frameChain", [])
+#         shadow = data.get("shadowPath", [])
+#         href = data.get("href")
+#         snippet = (data.get("text") or "").strip()[:80]  # первая строка подсказки
+#
+#         def _attempt(ctx):
+#             # 1) оригинальный путь
+#             el = find_in_context(ctx, data)
+#             if el:
+#                 return el
+#
+#             # 2) <a href="…">  (точный или c «/» на конце)
+#             if href:
+#                 el = ctx.find_elements(By.CSS_SELECTOR, f'a[href="{href}"],a[href="{href.rstrip("/")}"]')
+#                 if el:
+#                     return el[0]
+#
+#                 # подстраховка: домен + начало пути
+#                 netloc = urlparse(href).netloc
+#                 el = ctx.find_elements(By.CSS_SELECTOR, f'a[href*="{netloc}"]')
+#                 if el:
+#                     return el[0]
+#
+#             # 3) текстовый фрагмент (упрощённый вариант, без XPath)
+#             if snippet:
+#                 for a in ctx.find_elements(By.TAG_NAME, "a"):
+#                     if snippet.lower() in (a.text or "").lower():
+#                         return a
+#
+#             return None
+#
+#         def _find(_driver):
+#             try:
+#                 switch_to_frame_chain(_driver, chain)
+#                 ctx = _driver if not shadow else enter_shadow_path(_driver, shadow)
+#                 return _attempt(ctx)
+#             except Exception:
+#                 return None
+#
+#         try:
+#             return WebDriverWait(driver, timeout).until(_find)
+#         except TimeoutException:
+#             return None
+#     # chain = data.get("frameChain", [])
+#     # shadow = data.get("shadowPath", [])
+#     #
+#     # def _find(_):
+#     #     try:
+#     #         switch_to_frame_chain(driver, chain)
+#     #         ctx = driver if not shadow else enter_shadow_path(driver, shadow)
+#     #         return find_in_context(ctx, data)
+#     #     except Exception:
+#     #         return None
+#     # try:
+#     #     return WebDriverWait(driver, timeout).until(_find)
+#     # except TimeoutException:
+#     #     return None
 
 
 def perform_click(driver, x: int, y: int):
@@ -185,6 +297,7 @@ def cookie_killer(drv):
     except Exception:
         pass
 
+
 # ---------- core replay ----------------------------------------------------
 
 def replay_events(
@@ -193,7 +306,6 @@ def replay_events(
         user_agent: Optional[str] = None,
         cookies: Optional[List[Dict[str, Any]]] = None,
         proxy: Optional[str] = None) -> Tuple[list[Dict[str, Any]], str]:
-
     global step_counter
     last_kill = time.time()
     skip_substrings = skip_substrings or set()
@@ -208,11 +320,27 @@ def replay_events(
 
     opts = uc.ChromeOptions()
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    if user_agent:
-        opts.add_argument(f"--user-agent={user_agent}")
+
+    need_random = proxy is not None  # рандомим только если выходим через прокси
+
+    if not user_agent:
+        if need_random:
+            try:
+                ua = UserAgent()
+                user_agent = ua.random
+                log(f"[INFO] Randomly selected User-Agent: {user_agent}")
+            except Exception as e:
+                log(f"[Log ERROR] {e}")  # На всякий случай подставляем дефолтный user-agent, чтобы не упасть
+                # user_agent = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                #               "Chrome/115.0.0.0 Safari/537.36")
+                user_agent = settings.DEFAULT_UA
+                log(f"[INFO] Default User-Agent from .env selected: {user_agent}")
+        else:
+            user_agent = user_agent = settings.DEFAULT_UA
+            log(f"[INFO] Default User-Agent from .env selected: {user_agent}")
     if proxy:
         opts.add_argument(f"--proxy-server={proxy}")
-
+    opts.add_argument(f"--user-agent={user_agent}")
     driver = uc.Chrome(options=opts)
 
     if cookies:
@@ -226,7 +354,7 @@ def replay_events(
                 except Exception:
                     pass
 
-    handles, last_url, prev_input = {}, {}, None
+    handles, prev_input = {}, None
 
     for ev in events:
         if time.time() - last_kill >= 5:
@@ -245,6 +373,7 @@ def replay_events(
         tab = ev.get("tabId")
         if tab is None:
             continue
+
         if tab not in handles:
             driver.switch_to.new_window("tab")
             handles[tab] = driver.current_window_handle
@@ -252,45 +381,99 @@ def replay_events(
             if url0:
                 driver.get(url0)
                 wait_for_dom_ready(driver)
-                last_url[tab] = url0
+                time.sleep(1.5)
+                st = tabs[tab]
+                now = time.time()
+                st.last_user_ts = st.last_nav_ts = now
+                st.last_url = url0
 
         driver.switch_to.window(handles[tab])
         data = ev.get("data", {}) or {}
 
         try:
-            # NAVIGATION ---------------------------------------------------
+            # обновляем последний интерактивный таймштамп
+            if typ in {"click", "wheel", "scroll", "keydown", "input", "drag_sequence", "form_submit"}:
+                tabs[tab].last_user_ts = time.time()
+
+            # NAVIGATION ------------------------------------------------
             if typ == "navigate_intent":
                 href = data.get("href")
                 if not href:
                     continue
-                href = normalize_href(href, last_url.get(tab, href))
+
+                if data.get("tag") == "form" or data.get("role") == "search":
+                    continue
+                # отсекаем нефизические навигации
+                if not data.get("was_recent_click"):
+                    continue
+
+                st = tabs[tab]
+
+                # нормализуем полный URL
+                href_full = normalize_href(href, st.last_url)
+                # если дублирующий переход — пропускаем
+                if st.pending_url == href_full:
+                    log(f"    >>> duplicate NAV intent to '{href_full}', skipped")
+                    continue
+                st.pending_url = href_full
+
                 method = "DIRECT"
-                # 1) пробуем найти <a> и кликнуть
-                el = resolve_element(driver, data, timeout=0.6)
+                raw_el = resolve_element(driver, data, timeout=0.6)
+                el = raw_el
+                if el and el.tag_name.lower() != "a":
+                    try:
+                        el = el.find_element(By.XPATH, "./ancestor::a[1]")
+                    except Exception:
+                        el = raw_el
+
                 if el:
                     try:
-                        el.click()
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'})", el)
+                        driver.execute_script(
+                            "const r = arguments[0].getBoundingClientRect();"
+                            "window.scrollBy(0, r.top - window.innerHeight/2);", el)
+                        ActionChains(driver).move_to_element(el).click().perform()
                         method = "LINK"
-                    except Exception:
+                    except Exception as e:
+                        log(f"[DEBUG] click via LINK failed: {e}")
                         el = None
-                # 2) если не кликается — координаты
+
                 if not el and data.get("boundingRect"):
                     bbox = data["boundingRect"]
                     try:
-                        perform_click(driver, bbox.get("x", 0)+3, bbox.get("y", 0)+3)
+                        perform_click(driver, bbox.get("x", 0) + 3, bbox.get("y", 0) + 3)
                         method = "COORD"
                     except Exception:
                         pass
-                # 3) если всё провалилось — прямой get()
+
                 if method == "DIRECT":
-                    driver.get(href)
+                    driver.get(href_full)
                 wait_for_dom_ready(driver)
-                last_url[tab] = driver.current_url
+                st.last_url = driver.current_url
                 log(f"    >>> NAV via {method}")
                 continue
 
+            # COMPLETED NAVIGATION --------------------------------------
             if typ == "completed_navigation":
-                last_url[tab] = data.get("url", driver.current_url)
+                now = time.time()
+                url_now = data.get("url", driver.current_url)
+                st = tabs[tab]
+
+                # если ожидали именно этот URL — сбрасываем pending и принимаем
+                if st.pending_url and url_now.startswith(st.pending_url):
+                    st.pending_url = None
+                    st.last_url = url_now
+                    st.last_nav_ts = now
+                    log(f"    >>> NAV accepted (pending): {url_now}")
+                else:
+                    # fallback: по таймингу старые переходы
+                    accept = (now - st.last_user_ts >= 0.15 and now - st.last_nav_ts >= 0.30)
+                    if accept:
+                        st.last_url = url_now
+                        st.last_nav_ts = now
+                        log(f"    >>> NAV accepted: {url_now}")
+                    else:
+                        log(f"    !!! NAV ignored:  {url_now}")
                 continue
 
             # ACTIONS ------------------------------------------------------
@@ -308,9 +491,28 @@ def replay_events(
 
             elif typ == "keydown":
                 act = driver.switch_to.active_element
-                key = data.get("key", "")
-                mods = [k for k, f in [(Keys.CONTROL, "ctrlKey"), (Keys.SHIFT, "shiftKey"), (Keys.ALT, "altKey"), (Keys.COMMAND, "metaKey")] if data.get(f)]
-                act.send_keys(*mods, key)
+                raw_key = data.get("key", "")
+                # если это «Enter», мапим на настоящий Keys.ENTER
+                if raw_key.lower() == "enter":
+                    selenium_key = Keys.ENTER
+                elif raw_key.lower() in ("meta", "command"):
+                    selenium_key = Keys.META  # или Keys.COMMAND
+                else:
+                    # для любых остальных клавиш — передаём 그대로 строку
+                    selenium_key = raw_key
+
+                # собираем модификаторы
+                mods = [
+                    k for k, flag in [
+                        (Keys.CONTROL, "ctrlKey"),
+                        (Keys.SHIFT, "shiftKey"),
+                        (Keys.ALT, "altKey"),
+                        (Keys.COMMAND, "metaKey"),
+                        (Keys.META, "metaKey"),
+                    ] if data.get(flag)
+                ]
+                # наконец — шлём все вместе
+                act.send_keys(*mods, selenium_key)
 
             elif typ == "input":
                 el = resolve_element(driver, data)
@@ -321,11 +523,13 @@ def replay_events(
                     if prev_input == sel and val.startswith(cur):
                         el.send_keys(val[len(cur):])
                     else:
-                        el.clear(); el.send_keys(val)
+                        el.clear();
+                        el.send_keys(val)
                     prev_input = sel
 
             elif typ == "scroll":
-                driver.execute_script("window.scrollTo(arguments[0], arguments[1]);", data.get("x", 0), data.get("y", 0))
+                driver.execute_script("window.scrollTo(arguments[0], arguments[1]);", data.get("x", 0),
+                                      data.get("y", 0))
 
             elif typ == "wheel":
                 driver.execute_script("window.scrollBy(0, arguments[0]);", data.get("deltaY", data.get("y", 0)))
@@ -357,9 +561,11 @@ def replay_events(
     driver.quit()
     return final_cookies, final_user_agent
 
+
 # ---------- CLI -----------------------------------------------------------
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="Replay browser session (fast mode)")
     parser.add_argument("--log", default="sorted_log.json", help="Path to events JSON")
     parser.add_argument("--skip", default="", help="Comma-separated substrings to skip")
@@ -376,13 +582,15 @@ if __name__ == "__main__":
             with open(args.cookies, "r", encoding="utf-8") as f:
                 cookies_list = json.load(f)
         except Exception as e:
-            log(f"[Cookie ERROR] {e}"); sys.exit(1)
+            log(f"[Cookie ERROR] {e}");
+            sys.exit(1)
 
     try:
         with open(args.log, "r", encoding="utf-8") as f:
             evs = json.load(f)
     except Exception as e:
-        log(f"[Log ERROR] {e}"); sys.exit(1)
+        log(f"[Log ERROR] {e}");
+        sys.exit(1)
 
     ua_str = args.ua or None
     if not ua_str:
