@@ -306,9 +306,12 @@ def replay_events(
         user_agent: Optional[str] = None,
         cookies: Optional[List[Dict[str, Any]]] = None,
         proxy: Optional[str] = None) -> Tuple[list[Dict[str, Any]], str]:
+
     global step_counter
     last_kill = time.time()
     skip_substrings = skip_substrings or set()
+
+    events.sort(key=lambda e: e.get("timestamp", 0)) #  сортируем JSON инструкцию по timestamp чтобы реплей работал более стабильно и последовательно
 
     first_url: Dict[int, str] = {}
     for ev in events:
