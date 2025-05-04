@@ -213,6 +213,8 @@ def replay_events(
     global step_counter, last_kill
     last_kill = time.time()
 
+    events.sort(key=lambda e: e.get("timestamp", 0)) #  сортируем JSON инструкцию по timestamp чтобы реплей работал более стабильно и последовательно
+
     if skip_substrings is None:
         skip_substrings = set()
 
