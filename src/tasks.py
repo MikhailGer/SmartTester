@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from src.celery_app import celery_app
 from src.config import get_db
 import src.crud, src.models, src.replayer_new
@@ -29,39 +31,52 @@ def farm_cookie(task_id: int, base_session_id: int | None = None, skip_substring
     # Реплей фарминга
     inst_set = farm.instruction_set
     events = inst_set.instructions
+    p = farm.proxy
 
-    cookie, user_agent = src.replayer_new.replay_events(
-        events,
-        skip_substrings=set(skip_substrings or []),
-        user_agent=base_ua,
-        cookies=base_cookies,
-        proxy=None
-    )
+    p = farm.proxy
 
-    if inplace and base_session_id:
-        sess = src.crud.get_user_session(db, base_session_id)
-        us = src.crud.update_user_session(
-            db,
-            sess,
-            cookies=cookie,
-            user_agent=user_agent,
-        )
+    if p.login and p.password:
+        proxy_url = f"{p.type}://{p.login}:{p.password}@{p.ip}:{p.port}"
     else:
-        # иначе — создаём новую
-        us = src.crud.create_user_session(
-            db,
-            farm_task=farm,
-            cookies=cookie,
-            user_agent=user_agent,
-            parent_session_id=base_session_id
+        proxy_url = f"{p.type}://{p.ip}:{p.port}"
+
+    try:
+        cookie, user_agent = src.replayer_new.replay_events(
+            events,
+            skip_substrings=set(skip_substrings or []),
+            user_agent=base_ua,
+            cookies=base_cookies,
+            proxy=proxy_url
         )
 
-    src.crud.update_farm_task_status(
-        db,
-        farm,
-        status=src.models.StatusEnum.success
-    )
-    return f"Created UserSession {us.id} for FarmTask {task_id}"
+        if inplace and base_session_id:
+            sess = src.crud.get_user_session(db, base_session_id)
+            us = src.crud.update_user_session(
+                db,
+                sess,
+                cookies=cookie,
+                user_agent=user_agent,
+            )
+        else:
+            # иначе — создаём новую
+            us = src.crud.create_user_session(
+                db,
+                farm_task=farm,
+                cookies=cookie,
+                user_agent=user_agent,
+                parent_session_id=base_session_id
+            )
+
+        src.crud.update_farm_task_status(
+            db,
+            farm,
+            status=src.models.StatusEnum.success
+        )
+        return f"Created UserSession {us.id} for FarmTask {task_id}"
+
+    except Exception as e:
+        src.crud.update_farm_task_status(db, farm, src.models.StatusEnum.failed, error=str(e), completed_at=datetime.utcnow())
+        return f"FarmTask {task_id} failed with error {e}"
 
 
 @celery_app.task(name="run_job")

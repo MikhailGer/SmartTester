@@ -94,7 +94,7 @@ def run_farm_task(task_id: int, payload: FarmRunSchema, db: Session = Depends(ge
     )
 
     # Запланировать Celery-задачу
-    src.tasks.farm_cookie.delay(task_id, payload.base_session_id, ["hover", "dom-added"], payload.inplace)
+    src.tasks.farm_cookie.delay(task_id, payload.base_session_id, ["dom-added"], payload.inplace)
     return {"message": "Farm task scheduled", "task_id": task_id,
             "base_session_id": payload.base_session_id}
 
