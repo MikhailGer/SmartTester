@@ -1,8 +1,8 @@
 import json
 
 # Путь к исходному лог-файлу
-INPUT_FILE = "user_session_1746209959915.json"
-OUTPUT_FILE = "sorted_log4.json"
+INPUT_FILE = "log_examples/user_session_1746808617612.json"
+OUTPUT_FILE = "sorted_log6.json"
 
 # Загрузка логов
 with open(INPUT_FILE, "r", encoding="utf-8") as f:

@@ -9,6 +9,7 @@
 #   • В крайнем случае — fallback driver.get() (метод DIRECT).
 #   • В лог выводится, какой метод сработал: [LINK/COORD/DIRECT].
 # ------------------------------------------------------------
+SPEED = 1  # >1 – ускорить в 1.8×; <1 – замедлить
 import sys, os, json, time, datetime, random
 from pathlib import Path
 from html import unescape
@@ -17,11 +18,9 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 from fake_useragent import UserAgent
 from src.config import settings
 
-# import undetected_chromedriver as uc
-import seleniumwire.undetected_chromedriver as uc
-from mitmproxy import http
+import undetected_chromedriver as uc
 
-from selenium_stealth import stealth
+# from selenium_stealth import stealth
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
@@ -29,12 +28,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.actions.pointer_input import PointerInput
 from selenium.webdriver.common.actions.action_builder import ActionBuilder
 from selenium.common.exceptions import (
-    NoSuchElementException, TimeoutException, WebDriverException,
+    NoSuchElementException, TimeoutException, WebDriverException, MoveTargetOutOfBoundsException,
 )
 
 from dataclasses import dataclass
 from collections import defaultdict
-import tempfile, zipfile
+import socket, atexit, subprocess
 
 
 @dataclass
@@ -60,18 +59,17 @@ def log(msg: str):
     sys.stdout.flush()
 
 
+def _find_free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 # ---------- helpers --------------------------------------------------------
+
 # разделяет куки яндекса по доменам(особенность яндекса)
-def h2_blocker(flow: http.HTTPFlow):
-    if flow.request.pretty_host.endswith(('yandex.ru', 'ya.ru')):
-        # убираем ALPN h2 из ClientHello
-        if hasattr(flow.client_conn, 'alpn_offers'):
-            flow.client_conn.alpn_offers = [b'http/1.1']
-        # и принудительно понижаем CONNECT-туннель
-        if hasattr(flow.server_conn, 'alpn_offers'):
-            flow.server_conn.alpn_offers = [b'http/1.1']
-
-
 def _dup_ya_domains(ck: dict) -> list[dict]:
     d = ck.get('domain', '').lstrip('.')  # .ya.ru → ya.ru
     copies = [ck]  # всегда возвращаем исходник
@@ -108,34 +106,66 @@ def is_captcha_url(raw_url: str) -> bool:
     return any(kw in target for kw in CAPTCHA_KEYWORDS)
 
 
-def check_captcha(driver, pause_for: int = 20):
-    url = driver.current_url
-    if is_captcha_url(url):
-        log(f"!!! CAPTCHA detected at {url}, waiting {pause_for}s for manual solve…")
-        time.sleep(pause_for)
-        driver.refresh()
-        wait_for_dom_ready(driver)
-        new_url = driver.current_url
-        if is_captcha_url(new_url):
-            log(f"!!! CAPTCHA still present at {new_url}, aborting")
-            try:
-                driver.quit()
-            except:
-                pass
-            raise RuntimeError("CAPTCHA page still detected after manual wait")
-        else:
-            log(f"+++ CAPTCHA bypassed, continuing on {new_url}")
-            for d in ['ya.ru', '.ya.ru', 'yandex.ru', '.yandex.ru']:
-                try:
-                    # Selenium удаляет только для «текущего» домена,
-                    # поэтому сначала меняем location на нужный домен,
-                    # а потом вызываем delete_cookie.
-                    driver.get(f"https://{d.lstrip('.')}/favicon.ico")  # лёгкий «пинг» без редиректа
-                    driver.delete_cookie('spravka')
-                except Exception:
-                    pass
-            return True
-    return False
+def check_captcha(driver, pause_for: int = 60, poll_interval: int = 2) -> bool:
+    """
+    Если на странице капча, ждем её ручного решения до pause_for секунд,
+    каждые poll_interval секунд проверяя, не ушла ли капча.
+    Возвращает True, если капча была и успешно обойдена, False если не было капчи.
+    В случае, если капча осталась по истечении таймаута — кидает RuntimeError.
+    """
+    # проверяем сразу
+    try:
+        current = driver.current_url
+    except WebDriverException:
+        return False
+
+    if not is_captcha_url(current):
+        return False
+
+    log(f"!!! CAPTCHA detected at {current}, waiting up to {pause_for}s for manual solve…")
+    start = time.time()
+
+    # ждем решения: каждые poll_interval секунд проверяем URL
+    while time.time() - start < pause_for:
+        time.sleep(poll_interval)
+        try:
+            new_url = driver.current_url
+        except WebDriverException:
+            # если окно закрылось — выходим
+            break
+        if not is_captcha_url(new_url):
+            log(f"+++ CAPTCHA seems solved after {int(time.time() - start)}s, refreshing…")
+            break
+        log(f"    still captcha at {new_url}, waited {int(time.time() - start)}s…")
+    else:
+        # таймаут
+        log(f"!!! CAPTCHA still present after {pause_for}s, aborting")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        raise RuntimeError("CAPTCHA page still detected after timeout")
+
+    # обновляем страницу и качаем куки
+    driver.refresh()
+    wait_for_dom_ready(driver)
+    final = driver.current_url
+    if is_captcha_url(final):
+        log(f"!!! CAPTCHA reappeared at {final}, aborting")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        raise RuntimeError("CAPTCHA page still detected after refresh")
+
+    log(f"+++ CAPTCHA bypassed, continuing on {final}")
+    try:
+        time.sleep(0.3)
+        driver.delete_cookie('spravka')
+    except Exception:
+        pass
+
+    return True
 
 
 def merge_cookies(old_cookies: list[dict], new_cookies: list[dict]) -> list[dict]:
@@ -401,15 +431,22 @@ def perform_click(driver, x: int, y: int):
 def perform_drag(driver, seq: List[Dict[str, int]], pointer_type: str = "mouse"):
     if not seq:
         return
-    actions = ActionBuilder(driver)
-    mouse = PointerInput(PointerInput.MOUSE if pointer_type == "mouse" else PointerInput.PEN, "drag")
-    actions.add_action(mouse)
+
+    kind = "mouse" if pointer_type == "mouse" else "pen"
+    pointer = PointerInput(kind=kind, name="drag")
+    actions = ActionBuilder(driver, pointer)
+
+    # Начальная точка
     start = seq[0]
-    mouse.move_to_location(start["x"], start["y"])
-    mouse.pointer_down()
+    actions.pointer_action.move_to_location(start["x"], start["y"])
+    actions.pointer_action.pointer_down()
+
+    # Перемещение по точкам
     for pt in seq[1:]:
-        mouse.move_to_location(pt["x"], pt["y"], origin="pointer")
-    mouse.pointer_up()
+        actions.pointer_action.move_to_location(pt["x"], pt["y"])
+        actions.pointer_action.pause(0.01)  # добавим небольшую паузу для реалистичности
+
+    actions.pointer_action.pointer_up()
     actions.perform()
 
 
@@ -425,6 +462,64 @@ def safe_hover(driver, el, data) -> bool:
         return True
     except WebDriverException:
         return False
+
+
+def synthetic_hover(driver, el, data):
+    """
+    Человечный hover, привязанный к лог-дельте:
+      - движение по 3–6 шагам,
+      - одно микроколебание,
+      - остаток — dwell.
+    """
+    rect = el.rect
+    tx = rect['x'] + rect['width'] / 2
+    ty = rect['y'] + rect['height'] / 2
+
+    # общее время hover из лога (ms → s)
+    total = data.get('delta', 50) / 1000.0
+
+    # разбиваем это время:
+    # 50–60% идёт на движение, 5–10% на jitter, остальное — dwell
+    move_frac = random.uniform(0.5, 0.6)
+    jitter_frac = random.uniform(0.05, 0.1)
+    movement_time = total * move_frac
+    jitter_time = total * jitter_frac
+    dwell_time = max(0.0, total - movement_time - jitter_time)
+
+    # шаги движения: 3–6 точек
+    steps = random.randint(3, 6)
+    pause_per_step = movement_time / steps
+
+    # создаём action-builder
+    mouse = PointerInput(kind="mouse", name="mouse")
+    actions = ActionBuilder(driver, mouse)
+
+    # 1) основное движение к центру
+    for i in range(steps):
+        t = (i + 1) / steps
+        x = tx * t + random.gauss(0, 1)  # шум ±1px
+        y = ty * t + random.gauss(0, 1)
+        actions.pointer_action.move_to_location(int(x), int(y))
+        actions.pointer_action.pause(pause_per_step)
+    try:
+        actions.perform()
+    except MoveTargetOutOfBoundsException:
+        # если цель не в зоне — просто пропускаем
+        pass
+
+    # 2) одно микроколебание вокруг цели
+    ox = int(tx + random.uniform(-2, 2))
+    oy = int(ty + random.uniform(-2, 2))
+    micro = ActionBuilder(driver, mouse)
+    micro.pointer_action.move_to_location(ox, oy)
+    micro.pointer_action.pause(jitter_time)
+    try:
+        micro.perform()
+    except MoveTargetOutOfBoundsException:
+        pass
+
+    # 3) dwell
+    time.sleep(dwell_time)
 
 
 def cookie_killer(drv):
@@ -474,9 +569,13 @@ def replay_events(
 
     opts = uc.ChromeOptions()
 
+    # -------------------Part of stealth patch------------------------------------------
+    # opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    # opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--ignore-certificate-errors")
     opts.add_argument("--allow-insecure-localhost")
+    # --------------------------------------------------------------------------------
 
     need_random = proxy is not None  # рандомим только если выходим через прокси(пока заглушка на FALSE)
 
@@ -495,69 +594,75 @@ def replay_events(
             user_agent = settings.DEFAULT_UA
             log(f"[INFO] Default User-Agent from .env selected: {user_agent}")
 
-    seleniumwire_opts = {}
+    # seleniumwire_opts = {}
+    #
+    # if proxy:
+    #
+    #     sw_port = 9000 + (os.getpid() % 1000)
+    #     p = urlparse(proxy)  # proxy = "http://user:pass@host:port"
+    #     if "://" not in proxy:
+    #         proxy = "http://" + proxy
+    #         creds = ""
+    #         p = urlparse(proxy)
+    #
+    #     if p.username and p.password:
+    #         creds = f"{p.username}:{p.password}@"
+    #         # HTTP и HTTPS прокси с авторизацией
+    #
+    #         seleniumwire_opts = {
+    #             # 'disable_http2': ['.yandex.ru', '.ya.ru'],
+    #             'port': sw_port,
+    #             'proxy': {
+    #                 'http': f"http://{creds}{p.hostname}:{p.port}",
+    #                 'https': f"http://{creds}{p.hostname}:{p.port}",
+    #
+    #             },
+    #             'exclude_hosts': ['localhost', '127.0.0.1'],
+    #             # 'mitmproxy_opts': {
+    #             #     'http2': False
+    #             # },
+    #             # 'mitmproxy_addons': [h2_blocker],
+    #         }
+    #     else:
+    #         seleniumwire_opts = {
+    #             # 'disable_http2': ['.yandex.ru', '.ya.ru'],
+    #             'port': sw_port,
+    #             'proxy': {
+    #                 'http': f"http://{p.hostname}:{p.port}",
+    #                 'https': f"http://{p.hostname}:{p.port}",
+    #             },
+    #             'exclude_hosts': ['localhost', '127.0.0.1'],
+    #             # 'mitmproxy_opts': {
+    #             #     'http2': False
+    #             # },
+    #             # 'mitmproxy_addons': [h2_blocker],
+    #         }
 
     if proxy:
-
-        sw_port = 9000 + (os.getpid() % 1000)
-        p = urlparse(proxy)  # proxy = "http://user:pass@host:port"
-        if "://" not in proxy:
-            proxy = "http://" + proxy
-            creds = ""
-            p = urlparse(proxy)
-
-        if p.username and p.password:
-            creds = f"{p.username}:{p.password}@"
-            # HTTP и HTTPS прокси с авторизацией
-
-            seleniumwire_opts = {
-                'disable_http2': ['.yandex.ru', '.ya.ru'],
-                'port': sw_port,
-                'proxy': {
-                    'http': f"http://{creds}{p.hostname}:{p.port}",
-                    'https': f"http://{creds}{p.hostname}:{p.port}",
-
-                },
-                'exclude_hosts': ['localhost', '127.0.0.1'],
-                'mitmproxy_opts': {
-                    'http2': False
-                },
-                'mitmproxy_addons': [h2_blocker],
-            }
-        else:
-            seleniumwire_opts = {
-                'disable_http2': ['.yandex.ru', '.ya.ru'],
-                'port': sw_port,
-                'proxy': {
-                    'http': f"http://{p.hostname}:{p.port}",
-                    'https': f"http://{p.hostname}:{p.port}",
-                },
-                'exclude_hosts': ['localhost', '127.0.0.1'],
-                'mitmproxy_opts': {
-                    'http2': False
-                },
-                'mitmproxy_addons': [h2_blocker],
-            }
-
+        print(proxy)
+        # proxy == "http://127.0.0.1:<port>" после поднятого proxy.py
+        opts.add_argument(
+            "--proxy-server="
+            f"http={proxy};https={proxy}"
+        )
     opts.add_argument(f"--user-agent={user_agent}")
 
-    opts.add_argument("--disable-http2")
+    # opts.add_argument("--disable-http2")
 
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!SW OPTS:", seleniumwire_opts)
-    driver = uc.Chrome(options=opts,
-                       seleniumwire_options=seleniumwire_opts
-                       )
+    # print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!SW OPTS:", seleniumwire_opts)
+
+    driver = uc.Chrome(options=opts)
 
     # ————— STEALTH.PY INTEGRATION —————
-    stealth(
-        driver,
-        languages=["en-US", "en"],
-        vendor="Google Inc.",
-        platform="Win32",
-        webgl_vendor="Intel Inc.",
-        renderer="Intel Iris OpenGL Engine",
-        fix_hairline=True,
-    )
+    # stealth(
+    #     driver,
+    #     languages=["en-US", "en"],
+    #     vendor="Google Inc.",
+    #     platform="Win32",
+    #     webgl_vendor="Intel Inc.",
+    #     renderer="Intel Iris OpenGL Engine",
+    #     fix_hairline=True,
+    # )
     # ————— END STEALTH.PY —————
 
     # ————— STEALTH PATCH START —————
@@ -571,6 +676,101 @@ def replay_events(
         "platform": "Win32",
         "hardwareConcurrency": random.choice([4, 8, 12]),
         "deviceMemory": random.choice([4, 8, 16])
+    })
+    STEALTH_JS = r"""
+    // 1) navigator.webdriver
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+    // 2) window.chrome
+    window.chrome = {
+      runtime: {},
+      // можно добавить другие методы/проперти, которые проверяют сайты
+    };
+
+    // 3) Permissions API
+    const origQuery = window.navigator.permissions.query;
+    window.navigator.permissions.__proto__.query = parameters =>
+      parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : origQuery(parameters);
+
+    // 4) Plugins & MimeTypes
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [ { name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' } ]
+    });
+    Object.defineProperty(navigator, 'mimeTypes', {
+      get: () => [ { type: 'application/pdf' } ]
+    });
+
+    // 5) languages
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['en-US', 'en']
+    });
+
+    // 6) WebGL vendor/renderer spoof
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+      // 37445 = UNMASKED_VENDOR_WEBGL, 37446 = UNMASKED_RENDERER_WEBGL
+      if (parameter === 37445) return 'Intel Inc.';
+      if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+      return getParameter.call(this, parameter);
+    };
+
+    // 7) userAgent override (если нужно ещё подменить в рантайме)
+    Object.defineProperty(navigator, 'userAgent', {
+      get: () => window.__originalUA || navigator.userAgent
+    });
+    
+    // Canvas
+const toDataURL = HTMLCanvasElement.prototype.toDataURL;
+HTMLCanvasElement.prototype.toDataURL = function() {
+  this.getContext('2d').fillText(' ', 0, 0);
+  return toDataURL.apply(this, arguments);
+};
+// AudioContext
+const origCreateAnalyser = AudioContext.prototype.createAnalyser;
+AudioContext.prototype.createAnalyser = function() {
+  const analyser = origCreateAnalyser.apply(this, arguments);
+  const origGetFloatFrequencyData = analyser.getFloatFrequencyData;
+  analyser.getFloatFrequencyData = function() {
+    arguments[0] = arguments[0].map(v => v + (Math.random() * 0.0001));
+    return origGetFloatFrequencyData.apply(this, arguments);
+  };
+  return analyser;
+};
+
+Object.defineProperty(navigator, 'connection', {
+  get: () => ({ effectiveType: '4g', downlink: 10, rtt: 50 })
+});
+
+    const origRTCPeer = window.RTCPeerConnection;
+window.RTCPeerConnection = function(config) {
+  const pc = new origRTCPeer(config);
+  const origCreateOffer = pc.createOffer;
+  pc.createOffer = function() {
+    return origCreateOffer.call(this).then(offer => {
+      return new RTCSessionDescription({
+        type: offer.type,
+        sdp: offer.sdp.replace(/a=candidate:.+\r\n/g, '')
+      });
+    });
+  };
+  return pc;
+};
+delete window.console.debug;
+
+const origFunctionToString = Function.prototype.toString;
+Function.prototype.toString = function() {
+  if (this === navigator.permissions.query) {
+    return 'function query() { [native code] }';
+  }
+  return origFunctionToString.call(this);
+};
+    
+    """
+    orig_ua = driver.execute_cdp_cmd('Browser.getVersion', {})['userAgent']
+    driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+        'source': f"window.__originalUA = '{orig_ua}';\n{STEALTH_JS}"
     })
     # ————— STEALTH PATCH END —————
 
@@ -603,7 +803,7 @@ def replay_events(
     handles, prev_input = {}, None
 
     for ev in events:
-        check_captcha(driver, pause_for=30)
+        check_captcha(driver, pause_for=60)
         if time.time() - last_kill >= 5:
             cookie_killer(driver)
             last_kill = time.time()
@@ -642,7 +842,8 @@ def replay_events(
 
         try:
             # обновляем последний интерактивный таймштамп
-            if typ in {"click", "wheel", "scroll", "keydown", "input", "drag_sequence", "form_submit"}:
+            if typ in {"click", "wheel", "scroll", "keydown", "input",
+                       "drag_sequence", "form_submit", "hover", "hover_generic"}:
                 tabs[tab].last_user_ts = time.time()
 
             # NAVIGATION ------------------------------------------------
@@ -712,7 +913,7 @@ def replay_events(
                     log(f"    >>> NAV via {method}, landed on {current}")
 
                     # проверяем капчу лишь по ключевым словам
-                    check_captcha(driver, pause_for=20)
+                    check_captcha(driver, pause_for=60)
                     # lc = current.lower()
                     # if any(kw in lc for kw in CAPTCHA_KEYWORDS):
                     #     if attempt < MAX_NAV_RETRIES:
@@ -770,19 +971,36 @@ def replay_events(
                     bbox = data.get("boundingRect", {})
                     perform_click(driver, bbox.get("x", 0), bbox.get("y", 0))
 
-            elif typ == "keydown":
-                act = driver.switch_to.active_element
-                raw_key = data.get("key", "")
-                # если это «Enter», мапим на настоящий Keys.ENTER
-                if raw_key.lower() == "enter":
-                    selenium_key = Keys.ENTER
-                elif raw_key.lower() in ("meta", "command"):
-                    selenium_key = Keys.META  # или Keys.COMMAND
-                else:
-                    # для любых остальных клавиш — передаём 그대로 строку
-                    selenium_key = raw_key
 
-                # собираем модификаторы
+            elif typ == "keydown":
+                # 1) Находим элемент и фокусируем на нём
+                el = resolve_element(driver, data, timeout=0.5)
+                if el:
+                    try:
+                        el.click()
+                    except:
+                        driver.execute_script("arguments[0].focus()", el)
+                else:
+                    el = driver.switch_to.active_element
+                raw_key = data.get("key", "")
+                # 2) Мэппинг спецклавиш из лога в реальные selenium Keys или символы
+                special = {
+                    "Backspace": Keys.BACKSPACE,
+                    "Enter": Keys.ENTER,
+                    "Tab": Keys.TAB,
+                    " ": " ",
+                    "Spacebar": " ",
+                    # при необходимости можно докинуть ещё: "Escape": Keys.ESCAPE, и т. д.
+                }
+                # 3) Выбираем, что именно шлём: либо спецклавишу, либо одиночный символ
+                if raw_key in special:
+                    selenium_key = special[raw_key]
+                elif len(raw_key) == 1:
+                    selenium_key = raw_key
+                else:
+                    # непривычный key, просто игнорируем
+                    continue
+                # 4) Собираем модификаторы (Ctrl, Shift и т.п.) из data и шлём всё вместе
                 mods = [
                     k for k, flag in [
                         (Keys.CONTROL, "ctrlKey"),
@@ -792,29 +1010,100 @@ def replay_events(
                         (Keys.META, "metaKey"),
                     ] if data.get(flag)
                 ]
-                # наконец — шлём все вместе
-                act.send_keys(*mods, selenium_key)
+                el.send_keys(*mods, selenium_key)
+                # 5) Пауза, чтобы выдержать timing из лога
+                time.sleep(max(0.01, data.get("delta", 50) / 1000))
 
-            elif typ == "input":
-                el = resolve_element(driver, data)
-                if el:
-                    sel = data.get("selector") or build_combined_selector(data) or ""
-                    val = data.get("value", "")
-                    cur = el.get_attribute("value") or ""
-                    if prev_input == sel and val.startswith(cur):
-                        el.send_keys(val[len(cur):])
-                    else:
-                        el.clear();
-                        el.send_keys(val)
-                    prev_input = sel
 
             elif typ == "scroll":
-                driver.execute_script("window.scrollTo(arguments[0], arguments[1]);", data.get("x", 0),
-                                      data.get("y", 0))
+                # целевые координаты из лога
+                target_x = data.get("x", 0)
+                target_y = data.get("y", 0)
+
+                # получаем текущие позиции прокрутки
+                current_x = driver.execute_script("return window.scrollX")
+                current_y = driver.execute_script("return window.scrollY")
+
+                # рандомное число шагов
+                steps = random.randint(5, 8)
+                dx = (target_x - current_x) / steps
+                dy = (target_y - current_y) / steps
+
+                # плавный скролл
+                for i in range(steps):
+                    driver.execute_script(
+                        "window.scrollBy(arguments[0], arguments[1]);",
+                        dx, dy
+                    )
+                    time.sleep(random.uniform(0.05, 0.2))
+
+                # небольшой «отскок» назад-вперёд
+                if random.random() < 0.3:
+                    driver.execute_script("window.scrollBy(arguments[0], arguments[1]);", -dx / 3, -dy / 3)
+                    time.sleep(0.1)
+                    driver.execute_script("window.scrollBy(arguments[0], arguments[1]);", dx / 3, dy / 3)
+
+
+
 
             elif typ == "wheel":
-                driver.execute_script("window.scrollBy(0, arguments[0]);", data.get("deltaY", data.get("y", 0)))
-                time.sleep(random.uniform(0.1, 0.2))
+
+                total = data.get("deltaY", data.get("y", 0))
+                log_dt = data.get("delta", abs(total)) / 1000.0
+                # число шагов пропорционально total, но не меньше 1 и не больше 6
+                base = max(1, min(5, int(abs(total) / 100)))
+                parts = random.randint(max(1, base - 1), base + 1)
+                vw = driver.execute_script("return window.innerWidth")
+                vh = driver.execute_script("return window.innerHeight")
+                moved = 0.0
+
+                for _ in range(parts):
+                    portion = total / parts
+                    dy = portion + random.uniform(-abs(portion) * 0.3, abs(portion) * 0.3)
+                    moved += dy
+                    if random.random() < 0.3:
+                        # CDP wheel из случайной точки
+                        x = random.randint(50, vw - 50)
+                        y = random.randint(50, vh - 50)
+                        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                            "type": "mouseWheel", "x": x, "y": y,
+                            "deltaX": 0, "deltaY": dy, "pointerType": "mouse"
+                        })
+                    else:
+                        driver.execute_script("window.scrollBy(0, arguments[0])", dy)
+                    # микроколебание курсора от центра
+                    if random.random() < 0.4:
+                        offset_x = random.randint(-5, 5)
+                        offset_y = random.randint(-5, 5)
+                        try:
+                            # сначала переместимся к центру, потом сделаем микросдвиг
+                            body = driver.find_element(By.TAG_NAME, "body")
+
+                            ActionChains(driver) \
+ \
+                                .move_to_element_with_offset(body, vw // 2, vh // 2) \
+ \
+                                .move_by_offset(offset_x, offset_y) \
+ \
+                                .pause(random.uniform(0.01, 0.03)) \
+ \
+                                .perform()
+                        except MoveTargetOutOfBoundsException:
+
+                            pass  # если вдруг за границы — просто пропускаем
+
+                # пауза так, чтобы суммарно уложиться в log_dt (ускорено через SPEED)
+
+                base_interval = (log_dt / parts) / SPEED
+                interval = random.uniform(base_interval * 0.8, base_interval * 1.2)
+                time.sleep(max(interval, 0.02))
+                # докручиваем остаток
+                remaining = total - moved
+                if abs(remaining) > 1:
+                    driver.execute_script("window.scrollBy(0, arguments[0])", remaining)
+                    time.sleep(random.uniform(0.05, 0.15))
+                # финишная пауза
+                time.sleep(random.uniform(0.02, 0.05))
 
             elif typ == "mouse_move":
                 pts = data.get("positions", [])
@@ -822,9 +1111,13 @@ def replay_events(
                     perform_drag(driver, pts, data.get("pointerType", "mouse"))
                 time.sleep(random.uniform(0.05, 0.15))
 
-            elif typ == "hover":
+            elif typ in {"hover", "hover_generic"}:
                 el = resolve_element(driver, data, timeout=0.5)
-                if not safe_hover(driver, el, data):
+                # if not safe_hover(driver, el, data):
+                #     log("hover skipped")
+                if el:
+                    synthetic_hover(driver, el, data)
+                else:
                     log("hover skipped")
 
             elif typ == "drag_sequence":
@@ -857,6 +1150,24 @@ if __name__ == "__main__":
     parser.add_argument("--cookies", help="Path to JSON file with cookies")
     parser.add_argument("--proxy", help="Proxy URL, e.g. http://user:pass@host:port")
     args = parser.parse_args()
+
+    # --- здесь добавляем форвардер, если указан upstream-прокси ---
+    effective_proxy = None
+    if args.proxy:
+        upstream = args.proxy
+        port = _find_free_port()
+        forward = subprocess.Popen([
+            "proxy",  # proxy.py в PATH
+            "--plugins", "proxy.plugin.proxy_pool.ProxyPoolPlugin",
+            "--hostname", "127.0.0.1",
+            "--port", str(port),
+            "--proxy-pool", upstream,
+            "--threaded",
+        ])
+        # гарантируем, что форвардер убьётся при закрытии скрипта
+        atexit.register(lambda: (forward.terminate(), forward.wait()))
+        time.sleep(0.5)
+        effective_proxy = f"127.0.0.1:{port}"
 
     skip_set = {s.strip().lower() for s in args.skip.split(",") if s.strip()}
 
@@ -892,5 +1203,5 @@ if __name__ == "__main__":
         skip_substrings=skip_set,
         user_agent=ua_str,
         cookies=cookies_list,
-        proxy=args.proxy,
+        proxy=effective_proxy,
     )
